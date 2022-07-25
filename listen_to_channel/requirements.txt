@@ -1,1 +1,3 @@
 slack_sdk
+google-auth
+google-api-python-client

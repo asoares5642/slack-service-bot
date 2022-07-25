@@ -1,8 +1,10 @@
+from optparse import Values
 import os
 import json
 import base64
 import random
 import time
+from datetime import datetime
 
 import boto3
 from botocore.exceptions import ClientError
@@ -10,20 +12,38 @@ from botocore.exceptions import ClientError
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
 
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
+
 
 # This function is triggered when a new message is sent to the channel
 # The bot will reply to the user with an ephemeral message
 DYNAMODB_TABLE_NAME = os.environ['DYNAMODB_TABLE_NAME']
+SHEET_KEY = os.environ['SHEET_KEY']
+SLACK_BOT_SECRET_NAME = os.environ['SLACK_BOT_SECRET_NAME']
+SVC_CREDS_SECRET_NAME = os.environ['SVC_CREDS_SECRET_NAME']
 
-def lambda_handler(event, context):   
+def lambda_handler(event, context):
+
+    report = {
+        'timestamp': datetime.utcnow().isoformat() + 'Z',
+        'retry_num': event['headers'].get('X-Slack-Retry-Num'),
+        'retry_reason': event['headers'].get('X-Slack-Retry-Reason')
+    }
+
     print(json.dumps(event))
     print('Retrieving bot token...')
-    os.environ['SLACK_BOT_TOKEN'] = get_secret('slack_service_bot_token')['bot_token']
+    os.environ['SLACK_BOT_TOKEN'] = get_secret(SLACK_BOT_SECRET_NAME)['bot_token']
 
     # Create a Slack client and send an ephemeral message to the user on the same chanenel of the event
     print('Creating Slack client...')
     client = WebClient(token=os.environ["SLACK_BOT_TOKEN"])
     message_channel_event = json.loads(event['body'])['event']
+
+    report['client_message_id'] = message_channel_event['client_msg_id']
+    report['text'] = message_channel_event['text']
+    report['user_id'] = message_channel_event['user']
+    report['channel_id'] = message_channel_event['channel']
 
     user_id = message_channel_event['user']
     channel_id = message_channel_event['channel']
@@ -42,14 +62,16 @@ def lambda_handler(event, context):
         print(json.dumps(response))
         print('User record created.')
 
-    # If the last message was sent less than 10 minutes ago, don't send another one
+    # If the last message was sent less than 30 minutes ago, don't send another one
     if user_record.get('last_message_sent_at') is not None:
         last_message_sent_at = float(user_record['last_message_sent_at'])
-        if time.time() - last_message_sent_at < 600:
-            print('Last message sent less than 10 minutes ago. Not sending another one.')
+        if time.time() - last_message_sent_at < 1800:
+            print('Last message sent less than 30 minutes ago. Not sending another one.')
+            report['result'] = 'Message not sent - 30 minute cooldown'
+            log_to_sheets(report)
             return {
                 'statusCode': 200,
-                'body': json.dumps('Last message sent less than 10 minutes ago. Not sending another one.')
+                'body': json.dumps('Last message sent less than 30 minutes ago. Not sending another one.')
             }
     
     # Send the message
@@ -62,6 +84,11 @@ def lambda_handler(event, context):
     response = create_item(user_record)
     print(json.dumps(response))
     print('User record updated.')
+
+    # Log the record to google sheets
+    report['result'] = 'Message sent'
+    print('Logging to google sheets...')
+    log_to_sheets(report)
 
     return {
         'statusCode': 200,
@@ -172,3 +199,32 @@ def send_slack_message(client, user_id, channel_id):
     )
     print('Ephemeral message sent!')
     return response
+
+def build_sheets_service():
+    svc_info = get_secret(SVC_CREDS_SECRET_NAME)
+    credentials = service_account.Credentials.from_service_account_info(svc_info)
+    return build('sheets', 'v4', credentials=credentials).spreadsheets()
+
+def log_to_sheets(report):
+    service = build_sheets_service()
+
+    row = [[
+        report['timestamp'],
+        report['retry_num'],
+        report['retry_reason'],
+        report['text'],
+        report['client_message_id'],
+        report['user_id'],
+        report['channel_id'],
+        report['result']
+    ]]
+
+    sheet = service.values().append(
+        spreadsheetId= SHEET_KEY,
+        range='A:H',
+        valueInputOption='USER_ENTERED',
+        body={
+            'values': row
+        }
+    ).execute()
+    print('Logged to sheets!')
